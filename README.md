@@ -1,5 +1,3 @@
-# AirfoilExtractor
-
 # -*- coding: utf-8 -*-
 """
 Airfoil Parameter Extractor (Desktop GUI + Snipping Tool Overlay)
@@ -17,6 +15,10 @@ import csv
 import subprocess
 from math import comb
 import ctypes
+import json
+import html
+import urllib.request
+import urllib.error
 
 # 현재 실행 중인 Python 인터프리터에 필수 패키지가 없으면 자동 설치
 REQUIRED_PACKAGES = {
@@ -42,7 +44,7 @@ from scipy.interpolate import PchipInterpolator
 from scipy.signal import medfilt
 from scipy.optimize import least_squares
 
-from PySide6.QtCore import Qt, QRect, QPoint, QPointF, QTimer, Signal
+from PySide6.QtCore import Qt, QRect, QPoint, QTimer, Signal, QThread
 from PySide6.QtGui import (
     QPixmap,
     QImage,
@@ -53,6 +55,7 @@ from PySide6.QtGui import (
     QPolygonF,
     QGuiApplication,
     QFont,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -68,6 +71,10 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QMessageBox,
+    QTabWidget,
+    QTextBrowser,
+    QLineEdit,
+    QStackedWidget,
 )
 
 import matplotlib
@@ -89,6 +96,21 @@ if sys.platform == "win32":
 matplotlib.rcParams["axes.unicode_minus"] = False
 if sys.platform == "win32":
     matplotlib.rcParams["font.family"] = "Malgun Gothic"
+
+matplotlib.rcParams.update({
+    "figure.facecolor": "#111827",
+    "axes.facecolor": "#111827",
+    "savefig.facecolor": "#111827",
+    "text.color": "#e5e7eb",
+    "axes.labelcolor": "#e5e7eb",
+    "axes.edgecolor": "#94a3b8",
+    "xtick.color": "#cbd5e1",
+    "ytick.color": "#cbd5e1",
+    "grid.color": "#64748b",
+    "legend.facecolor": "#1f2937",
+    "legend.edgecolor": "#475569",
+    "legend.labelcolor": "#e5e7eb",
+})
 
 
 def qimage_to_rgb_array(qimg: QImage) -> np.ndarray:
@@ -518,6 +540,80 @@ def analyze_airfoil_image(rgb_img, mode="auto", align_mode="chord", thresh=40.0)
 # =====================================================================
 # 3. 메인 데스크톱 GUI 창
 # =====================================================================
+class ChatWorker(QThread):
+    delta = Signal(str)
+    answered = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, api_key, model, messages, context):
+        super().__init__()
+        self.api_key = api_key
+        self.model = model
+        self.messages = messages
+        self.context = context
+
+    def run(self):
+        payload = {
+            "model": self.model,
+            "instructions": (
+                "한국어로 답하는 에어포일 설계 보조 챗봇입니다. "
+                "이미지 분석값은 추정치입니다. 양력·항력 수치를 임의로 만들지 마세요. "
+                "정량적 성능 판단에는 운용 조건과 공력 해석이 필요합니다.\n" + self.context
+            ),
+            "input": self.messages,
+            "stream": True,
+        }
+        request = urllib.request.Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            },
+            method="POST",
+        )
+        try:
+            chunks = []
+            completed = False
+            with urllib.request.urlopen(request, timeout=90) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    if line == "data: [DONE]":
+                        break
+                    event = json.loads(line[6:])
+                    event_type = event.get("type")
+                    if event_type == "response.output_text.delta":
+                        piece = event.get("delta", "")
+                        if piece:
+                            chunks.append(piece)
+                            self.delta.emit(piece)
+                    elif event_type == "response.output_text.done" and not chunks:
+                        piece = event.get("text", "")
+                        if piece:
+                            chunks.append(piece)
+                            self.delta.emit(piece)
+                    elif event_type == "response.completed":
+                        completed = True
+                    elif event_type in ("response.failed", "error"):
+                        detail = event.get("message") or event.get("response", {}).get("error", {}).get("message") or "응답 생성에 실패했습니다."
+                        raise ValueError(detail)
+            answer = "".join(chunks)
+            if not completed or not answer.strip():
+                raise ValueError("답변이 완료되지 않았습니다. 다시 시도해 주세요.")
+            self.answered.emit(answer)
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.load(exc).get("error", {}).get("message", str(exc))
+            except Exception:
+                detail = str(exc)
+            self.failed.emit(f"API 오류 {exc.code}: {detail}")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -525,12 +621,19 @@ class MainWindow(QMainWindow):
         self.resize(1240, 740)
         self.setStyleSheet(
             """
-            QMainWindow { background-color: #f8fafc; }
+            QMainWindow, QWidget#Central { background-color: #0b1220; color: #e5e7eb; }
+            QLabel { color: #e5e7eb; }
             QFrame#Card {
-                background-color: #ffffff;
-                border: 1px solid #e2e8f0;
+                background-color: #1e293b;
+                border: 1px solid #334155;
                 border-radius: 10px;
             }
+            QComboBox, QSlider {
+                background-color: #1e293b;
+                color: #e5e7eb;
+            }
+            QComboBox { border: 1px solid #475569; border-radius: 5px; padding: 5px; }
+            QComboBox QAbstractItemView { background-color: #1e293b; color: #e5e7eb; selection-background-color: #334155; }
             QPushButton {
                 padding: 8px 14px;
                 border-radius: 7px;
@@ -542,15 +645,17 @@ class MainWindow(QMainWindow):
 
         self.current_rgb = None
         self.last_result = None
+        self.chat_messages = []
+        self.chat_worker = None
         self.snipper = SnippingOverlay()
         self.snipper.cropped_signal.connect(self.on_snip_completed)
         self.snipper.canceled_signal.connect(self.on_snip_canceled)
 
         self._init_ui()
-        self.load_demo_sample()
 
     def _init_ui(self):
         central = QWidget()
+        central.setObjectName("Central")
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(16, 16, 16, 16)
@@ -572,24 +677,15 @@ class MainWindow(QMainWindow):
         self.btn_open.clicked.connect(self.open_image_file)
 
         self.btn_paste = QPushButton("📋 클립보드 붙여넣기 (Ctrl+V)")
-        self.btn_paste.setStyleSheet("background-color: #e2e8f0; color: #1e293b;")
+        self.btn_paste.setStyleSheet("background-color: #334155; color: #e5e7eb;")
         self.btn_paste.clicked.connect(self.paste_from_clipboard)
-
-        self.btn_demo = QPushButton("샘플 불러오기")
-        self.btn_demo.setStyleSheet("background-color: #f1f5f9; color: #334155;")
-        self.btn_demo.clicked.connect(self.load_demo_sample)
 
         top_layout.addWidget(self.btn_snip)
         top_layout.addWidget(self.btn_open)
         top_layout.addWidget(self.btn_paste)
-        top_layout.addWidget(self.btn_demo)
         top_layout.addStretch()
 
-        top_layout.addWidget(QLabel("추출 모드:"))
-        self.combo_mode = QComboBox()
-        self.combo_mode.addItems(["자동 감지 (Auto)", "어두운 외곽선 (AxCent)", "붉은색 선 (그리드 제외)"])
-        self.combo_mode.currentIndexChanged.connect(self.reprocess_current)
-        top_layout.addWidget(self.combo_mode)
+        top_layout.addWidget(QLabel("추출 모드: AUTO"))
 
         top_layout.addWidget(QLabel("정렬:"))
         self.combo_align = QComboBox()
@@ -634,11 +730,11 @@ class MainWindow(QMainWindow):
             vbox = QVBoxLayout(card)
             vbox.setContentsMargins(12, 10, 12, 10)
             lbl_title = QLabel(title)
-            lbl_title.setStyleSheet("color: #64748b; font-size: 11px; font-weight: 600;")
+            lbl_title.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: 600;")
             lbl_val = QLabel("-")
-            lbl_val.setStyleSheet("color: #0f172a; font-size: 18px; font-weight: 700;")
+            lbl_val.setStyleSheet("color: #f8fafc; font-size: 18px; font-weight: 700;")
             lbl_sub = QLabel("-")
-            lbl_sub.setStyleSheet("color: #059669; font-size: 11px;")
+            lbl_sub.setStyleSheet("color: #34d399; font-size: 11px;")
             vbox.addWidget(lbl_title)
             vbox.addWidget(lbl_val)
             vbox.addWidget(lbl_sub)
@@ -653,17 +749,124 @@ class MainWindow(QMainWindow):
         plot_layout = QVBoxLayout(plot_card)
         plot_layout.setContentsMargins(8, 8, 8, 8)
 
-        self.fig = Figure(figsize=(12, 5.2), dpi=100, facecolor="#ffffff")
+        self.fig = Figure(figsize=(12, 5.2), dpi=100, facecolor="#111827")
         self.canvas = FigureCanvas(self.fig)
         plot_layout.addWidget(self.canvas)
 
         self.lbl_cst = QLabel("4차 CST 계수: -")
         self.lbl_cst.setStyleSheet(
-            "color: #334155; font-family: Consolas, monospace; font-size: 11px; padding: 4px 8px;"
+            "color: #cbd5e1; font-family: Consolas, monospace; font-size: 11px; padding: 4px 8px;"
         )
         plot_layout.addWidget(self.lbl_cst)
 
-        main_layout.addWidget(plot_card, stretch=1)
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #334155; background: #1e293b; }
+            QTabBar::tab { background: #1e293b; color: #cbd5e1; padding: 9px 18px; }
+            QTabBar::tab:selected { background: #334155; color: #ffffff; }
+        """)
+        self.tabs.addTab(plot_card, "분석 결과")
+        self.chat_stack = QStackedWidget()
+        self.chat_stack.setStyleSheet("background:#111827;")
+
+        key_page = QWidget()
+        key_layout = QVBoxLayout(key_page)
+        key_layout.setContentsMargins(36, 24, 36, 24)
+        key_layout.addStretch()
+        key_title = QLabel("AI 채팅을 시작하세요")
+        key_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        key_title.setStyleSheet("color:#f8fafc; font-size:25px; font-weight:700;")
+        key_layout.addWidget(key_title)
+        key_info = QLabel("OpenAI API 키를 입력하면 에어포일 분석값을 바탕으로 질문할 수 있습니다.")
+        key_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        key_info.setStyleSheet("color:#cbd5e1; font-size:12px; margin-top:7px;")
+        key_layout.addWidget(key_info)
+        key_layout.addSpacing(26)
+        key_form = QHBoxLayout()
+        key_form.addStretch()
+        key_fields = QVBoxLayout()
+        key_fields.setSpacing(10)
+        key_label = QLabel("OpenAI API 키")
+        key_label.setStyleSheet("color:#e5e7eb; font-size:12px; font-weight:600;")
+        key_fields.addWidget(key_label)
+        self.chat_api_key = QLineEdit(os.environ.get("OPENAI_API_KEY", ""))
+        self.chat_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.chat_api_key.setPlaceholderText("API 키를 입력하세요")
+        self.chat_api_key.setMinimumWidth(410)
+        self.chat_api_key.setStyleSheet("QLineEdit { background:#1e293b; color:#f8fafc; padding:12px; border:1px solid #475569; border-radius:8px; } QLineEdit:focus { border-color:#60a5fa; }")
+        self.chat_api_key.returnPressed.connect(self.open_chat)
+        key_fields.addWidget(self.chat_api_key)
+        self.key_error = QLabel("")
+        self.key_error.setStyleSheet("color:#fca5a5; font-size:11px;")
+        key_fields.addWidget(self.key_error)
+        self.chat_connect = QPushButton("채팅 시작")
+        self.chat_connect.setStyleSheet("QPushButton { background:#2563eb; color:white; padding:11px; border-radius:8px; } QPushButton:hover { background:#1d4ed8; }")
+        self.chat_connect.clicked.connect(self.open_chat)
+        key_fields.addWidget(self.chat_connect)
+        key_form.addLayout(key_fields)
+        key_form.addStretch()
+        key_layout.addLayout(key_form)
+        key_note = QLabel("키는 앱에 저장되지 않습니다. 채팅에는 인터넷 연결이 필요합니다.")
+        key_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        key_note.setStyleSheet("color:#94a3b8; font-size:11px; margin-top:14px;")
+        key_layout.addWidget(key_note)
+        key_layout.addStretch()
+        self.chat_stack.addWidget(key_page)
+
+        chat_page = QWidget()
+        chat_layout = QVBoxLayout(chat_page)
+        chat_layout.setContentsMargins(32, 20, 32, 24)
+        chat_layout.setSpacing(14)
+        setup_row = QHBoxLayout()
+        chat_heading = QLabel("설계 대화")
+        chat_heading.setStyleSheet("color:#f8fafc; font-size:17px; font-weight:700;")
+        setup_row.addWidget(chat_heading)
+        setup_row.addStretch()
+        setup_row.addWidget(QLabel("모델"))
+        self.chat_model = QComboBox()
+        self.chat_model.addItems(["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"])
+        setup_row.addWidget(self.chat_model)
+        change_key = QPushButton("키 변경")
+        change_key.setStyleSheet("QPushButton { background:transparent; color:#93c5fd; padding:7px 10px; } QPushButton:hover { color:white; }")
+        change_key.clicked.connect(lambda: self.chat_stack.setCurrentIndex(0))
+        setup_row.addWidget(change_key)
+        chat_layout.addLayout(setup_row)
+
+        self.chat_status = QLabel("질문을 입력하면 연결을 확인합니다.")
+        self.chat_status.setStyleSheet("color:#94a3b8; font-size:11px;")
+        chat_layout.addWidget(self.chat_status)
+        self.chat_view = QTextBrowser()
+        self.chat_view.setStyleSheet("background:#111827; color:#e5e7eb; border:0; padding:18px; font-size:13px;")
+        self.chat_view.setHtml('<div style="text-align:center; margin-top:90px; color:#f8fafc; font-size:24px;">어떻게 도와드릴까요?</div>')
+        chat_layout.addWidget(self.chat_view, stretch=1)
+
+        input_row = QHBoxLayout()
+        self.chat_input = QLineEdit()
+        self.chat_input.setPlaceholderText("질문을 입력하세요")
+        self.chat_input.setStyleSheet("QLineEdit { background:#1e293b; color:#f8fafc; padding:12px; border:1px solid #475569; border-radius:8px; } QLineEdit:focus { border-color:#60a5fa; }")
+        self.chat_input.returnPressed.connect(self.send_chat_message)
+        input_row.addWidget(self.chat_input, stretch=1)
+        self.chat_send = QPushButton("전송")
+        self.chat_send.setStyleSheet("QPushButton { background:#2563eb; color:white; padding:11px 20px; border-radius:8px; } QPushButton:hover { background:#1d4ed8; }")
+        self.chat_send.clicked.connect(self.send_chat_message)
+        input_row.addWidget(self.chat_send)
+        chat_layout.addLayout(input_row)
+        self.chat_stack.addWidget(chat_page)
+        self.tabs.addTab(self.chat_stack, "설계 가이드라인 · AI 채팅")
+        self.tabs.setCurrentIndex(1)
+        main_layout.addWidget(self.tabs, stretch=1)
+
+        # --- 우측 하단 문의처 ---
+        contact_row = QHBoxLayout()
+        contact_row.addStretch()
+        self.lbl_contact = QLabel(
+            '문의: 유국환 (<a href="mailto:kukhwanyu@gmail.com" '
+            'style="color:#93c5fd;">kukhwanyu@gmail.com</a>)'
+        )
+        self.lbl_contact.setOpenExternalLinks(True)
+        self.lbl_contact.setStyleSheet("color: #94a3b8; font-size: 10px; padding-right: 2px;")
+        contact_row.addWidget(self.lbl_contact)
+        main_layout.addLayout(contact_row)
 
     def start_snip_mode(self):
         self.showMinimized()
@@ -707,61 +910,20 @@ class MainWindow(QMainWindow):
         self.lbl_thresh.setText(str(val))
         self.reprocess_current()
 
-    def load_demo_sample(self):
-        """QPainter로 샘플 에어포일 이미지 생성 (cv2 불필요)"""
-        w, h = 640, 180
-        qimg = QImage(w, h, QImage.Format.Format_RGB888)
-        qimg.fill(QColor(222, 226, 232))
-
-        m, p, t = 0.055, 0.36, 0.165
-        c, x0, y0 = 510.0, 65.0, 112.0
-        betas = np.linspace(0, np.pi, 200)
-        xs = 0.5 * (1.0 - np.cos(betas))
-        yt = 5 * t * (0.2969 * np.sqrt(xs) - 0.1260 * xs - 0.3516 * xs**2 + 0.2843 * xs**3 - 0.1015 * xs**4)
-        yc = np.where(
-            xs < p,
-            (m / p**2) * (2 * p * xs - xs**2),
-            (m / (1 - p) ** 2) * ((1 - 2 * p) + 2 * p * xs - xs**2),
-        )
-        dyc = np.where(
-            xs < p,
-            (2 * m / p**2) * (p - xs),
-            (2 * m / (1 - p) ** 2) * (p - xs),
-        )
-        th = np.arctan(dyc)
-        ux = x0 + (xs - yt * np.sin(th)) * c
-        uy = y0 - (yc + yt * np.cos(th)) * c
-        lx = x0 + (xs + yt * np.sin(th)) * c
-        ly = y0 - (yc - yt * np.cos(th)) * c
-
-        pts = np.vstack([np.column_stack([ux, uy]), np.column_stack([lx[::-1], ly[::-1]])])
-        poly = QPolygonF([QPointF(float(px), float(py)) for px, py in pts])
-
-        painter = QPainter(qimg)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setBrush(QBrush(QColor(255, 255, 255)))
-        painter.setPen(QPen(QColor(45, 50, 60), 2.2))
-        painter.drawPolygon(poly)
-        painter.end()
-
-        self.current_rgb = qimage_to_rgb_array(qimg)
-        self.reprocess_current()
-
     def reprocess_current(self):
         if self.current_rgb is None:
             return
-        mode_map = {0: "auto", 1: "dark", 2: "red"}
         align_map = {0: "chord", 1: "horizontal"}
-        mode = mode_map.get(self.combo_mode.currentIndex(), "auto")
         align = align_map.get(self.combo_align.currentIndex(), "chord")
         thresh = float(self.slider_thresh.value())
 
         try:
-            res = analyze_airfoil_image(self.current_rgb, mode=mode, align_mode=align, thresh=thresh)
+            res = analyze_airfoil_image(self.current_rgb, mode="auto", align_mode=align, thresh=thresh)
             self.last_result = res
             self._update_summary_cards(res)
             self._draw_side_by_side(res)
         except Exception as e:
+            self.last_result = None
             self.fig.clear()
             ax = self.fig.add_subplot(111)
             ax.imshow(self.current_rgb)
@@ -769,9 +931,75 @@ class MainWindow(QMainWindow):
             ax.axis("off")
             self.canvas.draw()
 
+    def open_chat(self):
+        if not self.chat_api_key.text().strip():
+            self.key_error.setText("API 키를 입력해 주세요.")
+            self.chat_api_key.setFocus()
+            return
+        self.key_error.clear()
+        self.chat_stack.setCurrentIndex(1)
+        self.chat_input.setFocus()
+
+    def send_chat_message(self):
+        question = self.chat_input.text().strip()
+        if not question:
+            return
+        api_key = self.chat_api_key.text().strip()
+        if not api_key:
+            self.chat_api_key.setFocus()
+            self.chat_status.setText("먼저 OpenAI API 키를 입력하세요.")
+            return
+        if not self.chat_messages:
+            self.chat_view.clear()
+        self.chat_messages.append({"role": "user", "content": question})
+        self.chat_view.append(f'<p style="color:#93c5fd;"><b>나</b><br>{html.escape(question)}</p>')
+        self.chat_input.clear()
+        self.chat_input.setEnabled(False)
+        self.chat_send.setEnabled(False)
+        self.chat_status.setText("답변을 기다리는 중...")
+        if self.last_result is None:
+            context = "현재 분석된 에어포일 형상이 없습니다."
+        else:
+            r = self.last_result
+            context = (
+                f"현재 분석값: 캠버 {r['max_camber']*100:.2f}%, "
+                f"캠버 위치 {r['max_camber_pos']*100:.1f}%c, "
+                f"두께 {r['max_thick']*100:.2f}%, "
+                f"두께 위치 {r['max_thick_pos']*100:.1f}%c, "
+                f"앞전 반경 {r['le_radius']*100:.2f}%c, "
+                f"뒷전 쐐기각 {r['te_wedge']:.1f}도."
+            )
+        self.chat_worker = ChatWorker(api_key, self.chat_model.currentText(), self.chat_messages[-12:].copy(), context)
+        self.chat_view.append('<p style="color:#e5e7eb;"><b>답변</b><br></p>')
+        self.chat_worker.delta.connect(self._on_chat_delta)
+        self.chat_worker.answered.connect(self._on_chat_answer)
+        self.chat_worker.failed.connect(self._on_chat_error)
+        self.chat_worker.start()
+
+    def _on_chat_delta(self, piece):
+        cursor = self.chat_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(piece)
+        self.chat_view.setTextCursor(cursor)
+        self.chat_view.ensureCursorVisible()
+        self.chat_status.setText("답변을 작성하는 중...")
+
+    def _on_chat_answer(self, answer):
+        self.chat_messages.append({"role": "assistant", "content": answer})
+        self.chat_status.setText("연결됨 · 다음 질문을 입력할 수 있습니다.")
+        self.chat_input.setEnabled(True)
+        self.chat_send.setEnabled(True)
+        self.chat_input.setFocus()
+
+    def _on_chat_error(self, message):
+        self.chat_messages.pop()
+        self.chat_view.append(f'<p style="color:#fca5a5;">연결 오류: {html.escape(message)}</p>')
+        self.chat_status.setText("연결 실패 · API 키와 인터넷 연결을 확인하세요.")
+        self.chat_input.setEnabled(True)
+        self.chat_send.setEnabled(True)
+
     def _update_summary_cards(self, r):
         self.metric_labels["max_camber"][0].setText(f"{r['max_camber'] * 100:.2f}%")
-        self.metric_labels["max_camber"][1].setText(f"모드: {r['active_mode'].upper()}")
 
         self.metric_labels["max_camber_pos"][0].setText(f"{r['max_camber_pos'] * 100:.1f}%")
         self.metric_labels["max_camber_pos"][1].setText("전연(LE) 기준 코드 비율")
@@ -797,7 +1025,7 @@ class MainWindow(QMainWindow):
     def _draw_side_by_side(self, r):
         self.fig.clear()
         ax_orig, ax_norm = self.fig.subplots(1, 2)
-        self.fig.subplots_adjust(left=0.05, right=0.98, top=0.88, bottom=0.14, wspace=0.18)
+        self.fig.subplots_adjust(left=0.05, right=0.98, top=0.88, bottom=0.27, wspace=0.18)
 
         ax_orig.imshow(self.current_rgb)
         # 유효하게 채택된 포인트(연한 점)와 보정된 에어포일 곡선(실선) 표시
@@ -827,7 +1055,7 @@ class MainWindow(QMainWindow):
             zorder=5,
         )
         ax_orig.set_title("1. 캡처 원본 및 에어포일 선 검출", fontsize=11, fontweight="bold")
-        ax_orig.legend(loc="upper right", fontsize=8.5)
+        ax_orig.legend(loc="upper center", bbox_to_anchor=(0.5, -0.04), ncol=2, fontsize=8.5)
         ax_orig.axis("off")
 
         xg = r["x_grid"] * 100.0
@@ -838,7 +1066,7 @@ class MainWindow(QMainWindow):
         ax_norm.plot(xg, yu, "r-", lw=2.0, label="상면 (Upper)")
         ax_norm.plot(xg, yl, "b-", lw=2.0, label="하면 (Lower)")
         ax_norm.plot(xg, yc, "g--", lw=1.6, label="평균 캠버선 (Camber)")
-        ax_norm.axhline(0, color="black", linestyle=":", lw=1.0)
+        ax_norm.axhline(0, color="#94a3b8", linestyle=":", lw=1.0)
 
         idx_mt = int(np.argmax(r["thick"]))
         mt_x = r["max_thick_pos"] * 100.0
@@ -957,3 +1185,4 @@ if __name__ == "__main__":
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
+
